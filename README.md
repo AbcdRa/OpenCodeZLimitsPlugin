@@ -1,0 +1,112 @@
+# zaiplanplugin
+
+Плагин для OpenCode (GUI + TUI), который показывает остаток квот подписки
+**Z.AI GLM Coding Plan**: 5-часового и недельного пулов кредитов.
+
+Бейдж виден **только когда выбрана модель из z.ai coding plan**
+(providerID начинается с `zai` или modelID с `glm`).
+
+Протестировано на OpenCode / OpenCode Desktop **v2.2.7** (Linux).
+GUI-часть использует экспериментальный API (`gui-experimental`) — может
+меняться между версиями приложения.
+
+## Файлы
+
+| Файл | Что это |
+|---|---|
+| `index.ts` | Серверная часть: запрашивает квоту у api.z.ai, кэш 30 с, отдаёт по RPC |
+| `rpc.ts` | Общий RPC-контракт `zai-quota.status` (матчится по id между частями) |
+| `gui-experimental.cjs` | GUI-часть OpenCode Desktop (CommonJS без бандлера) |
+| `tui.tsx` | TUI-часть: бейдж в футере + слэш-команда `/quota` |
+
+## Что где показывается (GUI)
+
+- **Заголовок сессии** (`session.header`): SVG-бейдж — буква **z** внутри
+  **кругового кольца-прогресса** (сколько % израсходовано из 5-часового лимита).
+  Цвет динамический: зелёный < 50 %, янтарный 50–80 %, красный ≥ 80 %.
+  Наведение — подсказка с деталями и принудительное обновление, клик — тост.
+- **Палитра команд**: `Z.AI: квота Coding Plan` — тост с деталями обоих пулов.
+
+## Как это работает
+
+```
+api.z.ai ──fetch──> серверная часть (index.ts, кэш 30 c)
+                        │ RPC zai-quota.status
+                        ├──> GUI (титлбар + кольцо в заголовке сессии)
+                        └──> TUI (бейдж в футере, /quota)
+```
+
+Fetch делается в серверной части, а не в окне приложения, чтобы не зависеть
+от CORS. Обновление раз в 60 с.
+
+Ответ api.z.ai: `data.limits` — пулы с `unit: 3` (5 часов) и `unit: 6`
+(неделя), `data.level` — тариф (`lite`, `pro`, …). Отсутствующий пул
+передаётся объектом с нулями (`usage: 0`).
+
+## Установка
+
+### 1. Ключ API
+
+Положить ключ Z.AI Coding Plan (первый найденный вариант используется):
+
+1. переменная окружения `ZAI_API_KEY`, **или**
+2. `~/.config/opencode/zai-quota.key` (Linux/macOS; желательно `chmod 600`), **или**
+3. `%APPDATA%\opencode\zai-quota.key` (Windows), **или**
+4. `$XDG_CONFIG_HOME/opencode/zai-quota.key`
+
+### 2. Регистрация плагина
+
+В глобальном конфиге OpenCode (`~/.config/opencode/opencode.json`,
+на Windows `%USERPROFILE%\.config\opencode\opencode.json`):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["<путь к этой папке>"]
+}
+```
+
+Пример пути: Linux — `/home/user/pj/zaiplanplugin`,
+Windows — `C:/Users/user/pj/zaiplanplugin`.
+
+Если каталог лежит в `~/.config/opencode/plugins/`, регистрация не нужна —
+он загружается автоматически.
+
+### 3. Перезапуск
+
+Перезапустить OpenCode Desktop (GUI-часть подхватывается при старте окна).
+TUI-часть подхватывается и на лету.
+
+## Windows
+
+Заработает при условии, что стоит OpenCode Desktop для Windows: плагин не
+содержит Unix-специфичного кода — серверная часть работает в Bun-рантайме
+(fetch, node:fs, node:os кроссплатформенны), GUI-часть — обычный DOM в окне
+Electron, TUI-часть — Solid на том же рантайме. Отличия только в путях:
+
+- конфиг: `%USERPROFILE%\.config\opencode\opencode.json`
+- ключ: `%USERPROFILE%\.config\opencode\zai-quota.key` **или**
+  `%APPDATA%\opencode\zai-quota.key`
+- в `opencode.json` используйте Windows-путь к папке плагина
+  (прямые слэши `C:/...` надёжнее)
+
+## Отладка
+
+- Логи сервера: `~/.local/share/opencode/log/opencode.log`
+  (`role=server` — серверная часть, `role=cli` — TUI)
+- Логи Desktop: `~/.config/ai.opencode.desktop/logs/<метка времени>/`
+- Проверка RPC руками:
+  `opencode api post "/api/rpc/zai-quota/status?location[directory]=<каталог>" -d '{"input":{}}'`
+- Ошибки загрузки плагина ищите по `failed to load plugin ... zai-quota`
+
+## Известные ограничения
+
+- GUI-поверхности (`session.header`, `TitlebarItem`) — экспериментальный API,
+  имена слотов/полей могут поменяться в будущих версиях OpenCode.
+- `gui-experimental.cjs` написан руками без бандлера и рассчитан на то, что
+  приложение отдаёт плагину общие модули (`solid-js`,
+  `@opencode/plugin/gui`, `@opencode/plugin/rpc`). Если в какой-то версии
+  это сломается — собрать бандл через `@opencode/plugin/gui/vite`.
+- Схемы RPC в `rpc.ts` намеренно упрощены (без union-типов, отсутствующий
+  пул = нули): рантайм 2.2.7 падал на `Object.entries(undefined)` при более
+  «умных» схемах.
