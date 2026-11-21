@@ -169,6 +169,9 @@ opencode api post "/api/rpc/opencode-go-quota/status?location[directory]=<кат
 
 ## Авторство
 
-Исходный плагин для Z.AI сгенерирован LLM: модель **GLM** (`GLM-5.3-Flash`)
-компании **Z.ai**, работавшая кодинг-агентом в OpenCode. Поддержка OpenCode Go
-добавлена позже.
+- Исходный плагин для Z.AI: модель **GLM** (`GLM-5.3-Flash`) компании
+  **Z.ai**, работавшая кодинг-агентом в OpenCode.
+- Поддержка OpenCode Go, чтение ключей из интеграций OpenCode и обновление
+  документации: модель **DeepSeek V4.1 Flash 1017** (провайдер
+  **OpenCode Go**), работавшая кодинг-агентом в OpenCode.
+- Идея, постановка задач и проверка на живой среде: **AbcdRa**.
