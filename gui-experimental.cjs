@@ -1,4 +1,4 @@
-// Z.AI Coding Plan quota badge for OpenCode Desktop.
+// Квоты подписок Z.AI Coding Plan и OpenCode Go для OpenCode Desktop.
 //
 // Hand-written CommonJS, no bundler: the app provides the shared modules
 // (@opencode/plugin/gui, @opencode/plugin/rpc, solid-js) to the plugin, and
@@ -6,13 +6,14 @@
 // nothing needs compiling.
 //
 // Surfaces:
-//   - Slot "session.header": a "z" letter inside a circular SVG progress ring
-//     (5-hour pool usage) with dynamic color, next to the session title.
-//   - Command: palette command with a details toast.
+//   - Slot "session.header": a letter inside a circular SVG progress ring.
+//     "z" for Z.AI (5-hour pool) and "g" for OpenCode Go (rolling 5-hour
+//     window), with dynamic color, next to the session title.
+//   - Commands: palette commands with details toasts for each subscription.
 //
-// The ring renders only while the routed session's composer model
-// belongs to the z.ai coding plan (providerID starts with "zai" or modelID
-// starts with "glm"). Quota data comes from the plugin's server part over RPC.
+// The ring renders only while the routed session's composer model belongs to
+// the matching subscription. Quota data comes from the plugin's server part
+// over RPC.
 //
 // NOTE: the Rpc.define here must mirror rpc.ts of the server part — tokens
 // match by id, and both schemas must agree on the wire format.
@@ -57,6 +58,38 @@ const Quota = Rpc.define({
   events: {},
 })
 
+const goWindowSchema = {
+  type: "object",
+  properties: {
+    status: { type: "string" },
+    percent: { type: "number" },
+    resetsAt: { type: "number" },
+  },
+  required: ["status", "percent", "resetsAt"],
+  additionalProperties: false,
+}
+
+const GoQuota = Rpc.define({
+  id: "opencode-go-quota",
+  methods: {
+    status: {
+      input: { type: "object", properties: {}, required: [], additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          plan: { type: "string" },
+          rolling: goWindowSchema,
+          weekly: goWindowSchema,
+          monthly: goWindowSchema,
+        },
+        required: ["plan", "rolling", "weekly", "monthly"],
+        additionalProperties: false,
+      },
+    },
+  },
+  events: {},
+})
+
 function countdown(ms) {
   if (!ms || ms <= 0) return ""
   const min = Math.round(ms / 60000)
@@ -76,6 +109,21 @@ function hasData(l) {
   return !!l && (l.usage > 0 || l.remaining > 0)
 }
 
+// Окно Go считается доступным, если провайдер его вернул.
+function hasGoWindow(w) {
+  return !!w && w.status !== "" && w.status !== "unavailable"
+}
+
+function hasGo(g) {
+  return !!g && [g.rolling, g.weekly, g.monthly].some(hasGoWindow)
+}
+
+function goWorstPct(g) {
+  if (!g) return 0
+  const windows = [g.rolling, g.weekly, g.monthly].filter(hasGoWindow)
+  return windows.length ? Math.max.apply(null, windows.map(function (w) { return w.percent })) : 0
+}
+
 function colorFor(pct) {
   if (pct >= 80) return "#f7768e" // red — пул почти исчерпан
   if (pct >= 50) return "#e0af68" // amber
@@ -88,7 +136,7 @@ function svgEl(name, attrs) {
   return el
 }
 
-// Кольцо-прогресс: буква "z" внутри SVG-круга (трек + дуга использованных %).
+// Кольцо-прогресс: буква внутри SVG-круга (трек + дуга использованных %).
 function makeRing() {
   const svg = svgEl("svg", { width: 20, height: 20, viewBox: "0 0 20 20" })
   const tip = svgEl("title")
@@ -122,20 +170,24 @@ function makeRing() {
 module.exports = gui.Plugin.define({
   setup(ctx) {
     const [quota, setQuota] = createSignal(undefined)
+    const [goQuota, setGoQuota] = createSignal(undefined)
+    let activeMode = ""
 
     async function refresh() {
-      try {
-        // ctx.client меняется при перезапуске сервера — читаем в момент вызова.
-        setQuota(await ctx.client.rpc(Quota).status({}))
-      } catch {
-        setQuota(undefined)
-      }
+      // Провайдеры независимы: ошибка одного не должна скрывать данные другого.
+      // ctx.client меняется при перезапуске сервера — читаем в момент вызова.
+      const [z, g] = await Promise.allSettled([
+        ctx.client.rpc(Quota).status({}),
+        ctx.client.rpc(GoQuota).status({}),
+      ])
+      if (z.status === "fulfilled") setQuota(z.value)
+      if (g.status === "fulfilled") setGoQuota(g.value)
     }
 
     void refresh()
     const timer = setInterval(refresh, REFRESH_MS)
 
-    function showDetails() {
+    function showZaiDetails() {
       const q = quota()
       if (!q || (!hasData(q.fiveHour) && !hasData(q.weekly))) {
         ctx.toast.show({ variant: "error", title: "Z.AI: не удалось получить квоту" })
@@ -155,7 +207,26 @@ module.exports = gui.Plugin.define({
       })
     }
 
-    // --- Заголовок сессии: буква "z" в кольце-прогрессе 5-часового пула -----
+    function showGoDetails() {
+      const g = goQuota()
+      if (!hasGo(g)) {
+        ctx.toast.show({ variant: "error", title: "OpenCode Go: не удалось получить квоту" })
+        return
+      }
+      const fmt = (w) =>
+        hasGoWindow(w)
+          ? w.percent + "%" + (w.status !== "ok" ? " (" + w.status + ")" : "") +
+            " · сброс через " + (countdown(w.resetsAt - Date.now()) || "—")
+          : "нет данных"
+      ctx.toast.show({
+        title: "OpenCode Go" + (g.plan ? " (" + g.plan + ")" : ""),
+        description: "5 часов: " + fmt(g.rolling) + "\nНеделя: " + fmt(g.weekly) + "\nМесяц: " + fmt(g.monthly),
+        variant: goWorstPct(g) >= 80 ? "error" : "default",
+        duration: 8000,
+      })
+    }
+
+    // --- Заголовок сессии: буква в кольце-прогрессе активной подписки -------
     ctx.add(gui.Slot, {
       at: "session.header",
       order: 10,
@@ -166,26 +237,62 @@ module.exports = gui.Plugin.define({
         wrap.style.cursor = "pointer"
         const { svg, tip, prog, letter, RING_C } = makeRing()
         wrap.appendChild(svg)
-        wrap.addEventListener("click", showDetails)
+        wrap.addEventListener("click", () => {
+          if (activeMode === "go") showGoDetails()
+          else showZaiDetails()
+        })
         wrap.addEventListener("mouseenter", () => void refresh())
 
         createEffect(() => {
-          let zai = false
+          let providerID = ""
+          let modelID = ""
           try {
             const model = input.screen.composer.model()
-            zai = !!model && (model.providerID.startsWith("zai") || model.modelID.toLowerCase().startsWith("glm"))
+            providerID = String(model?.providerID ?? "")
+            modelID = String(model?.modelID ?? model?.id ?? "")
           } catch {
-            zai = false
+            // модель ещё не выбрана
           }
+          // Проверяем Go первым: у opencode-go тоже бывают модели glm-*.
+          const isGo = providerID.startsWith("opencode-go") || providerID === "opencode" || modelID.startsWith("opencode-go/")
+          const isZai = providerID.startsWith("zai") || modelID.toLowerCase().startsWith("glm")
+
           const q = quota()
-          const has = !!q && (hasData(q.fiveHour) || hasData(q.weekly))
-          wrap.style.display = zai && has ? "inline-flex" : "none"
-          if (!zai || !has) return
+          const g = goQuota()
+          const zaiReady = !!q && (hasData(q.fiveHour) || hasData(q.weekly))
+          const goReady = hasGo(g)
+
+          let mode = ""
+          if (isGo) mode = goReady ? "go" : ""
+          else if (isZai) mode = zaiReady ? "zai" : ""
+          else mode = zaiReady ? "zai" : goReady ? "go" : ""
+          activeMode = mode
+          wrap.style.display = mode ? "inline-flex" : "none"
+          if (!mode) return
+
+          if (mode === "go") {
+            const rolling = g.rolling
+            const primary = hasGoWindow(rolling) ? rolling : hasGoWindow(g.weekly) ? g.weekly : g.monthly
+            const pct = hasGoWindow(primary) ? primary.percent : 0
+            const color = colorFor(Math.max(pct, goWorstPct(g)))
+            prog.setAttribute("stroke", color)
+            prog.setAttribute("stroke-dashoffset", String(RING_C * (1 - pct / 100)))
+            letter.textContent = "g"
+            letter.setAttribute("fill", color)
+            const fmt = (w) => (hasGoWindow(w) ? w.percent + "%" : "—")
+            const rst = hasGoWindow(rolling) ? countdown(rolling.resetsAt - Date.now()) : ""
+            tip.textContent =
+              "OpenCode Go: 5ч " + fmt(rolling) + (rst ? ", сброс через " + rst : "") +
+              " · нед " + fmt(g.weekly) + " · мес " + fmt(g.monthly)
+            return
+          }
+
           const five = q.fiveHour
           const pct = usedPct(five)
           const color = colorFor(Math.max(pct, usedPct(q.weekly)))
           prog.setAttribute("stroke", color)
           prog.setAttribute("stroke-dashoffset", String(RING_C * (1 - pct / 100)))
+          letter.textContent = "z"
           letter.setAttribute("fill", color)
           const rst = countdown(five.nextResetTime - Date.now())
           tip.textContent =
@@ -204,7 +311,17 @@ module.exports = gui.Plugin.define({
       group: "Z.AI",
       run: async () => {
         await refresh()
-        showDetails()
+        showZaiDetails()
+      },
+    }))
+
+    ctx.add(gui.Command, () => ({
+      id: "go-details",
+      title: "OpenCode Go: квота",
+      group: "OpenCode Go",
+      run: async () => {
+        await refresh()
+        showGoDetails()
       },
     }))
 
