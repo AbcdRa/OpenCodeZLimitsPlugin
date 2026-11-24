@@ -102,3 +102,40 @@ export const GoQuota = Rpc.define({
   },
   events: {},
 })
+
+/**
+ * Bothub (bothub.chat): предоплаченный баланс в Caps, без временных окон.
+ * balance — сырой баланс, availableBalance — доступно с учётом кредитного лимита,
+ * planTokens — размер купленного пакета (0, если план неизвестен).
+ */
+export const EMPTY_BOTHUB_STATUS = {
+  balance: 0,
+  availableBalance: 0,
+  plan: "",
+  planTokens: 0,
+  planPrice: 0,
+  currency: "RUB",
+}
+
+export const BothubQuota = Rpc.define({
+  id: "bothub-quota",
+  methods: {
+    status: {
+      input: { type: "object", properties: {}, required: [], additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          balance: { type: "number" },
+          availableBalance: { type: "number" },
+          plan: { type: "string" },
+          planTokens: { type: "number" },
+          planPrice: { type: "number" },
+          currency: { type: "string" },
+        },
+        required: ["balance", "availableBalance", "plan", "planTokens", "planPrice", "currency"],
+        additionalProperties: false,
+      },
+    },
+  },
+  events: {},
+})

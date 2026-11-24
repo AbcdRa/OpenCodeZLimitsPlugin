@@ -1,11 +1,11 @@
 import { createMemo, createSignal } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
-import { GoQuota, Quota } from "./rpc"
+import { BothubQuota, GoQuota, Quota } from "./rpc"
 
 /**
- * Бейдж остатков подписок в футере: Z.AI GLM Coding Plan и OpenCode Go.
- * Показывается квота выбранной модели; если модель не из этих провайдеров —
- * бейдж Z.AI (как раньше), а при отсутствии данных Z.AI — бейдж OpenCode Go.
+ * Бейдж остатков подписок в футере: Z.AI GLM Coding Plan, OpenCode Go и баланс
+ * Bothub. Показывается квота выбранной модели; если модель не из этих
+ * провайдеров — бейдж Z.AI (как раньше), затем OpenCode Go, затем Bothub.
  *
  * Данные приходят из серверной части плагина (index.ts) через RPC — там
  * общий кэш на 30 с, поэтому TUI и GUI не дёргают провайдеров по отдельности.
@@ -40,6 +40,15 @@ type GoStatus = {
   monthly: GoWindow
 }
 
+type BothubStatus = {
+  balance: number
+  availableBalance: number
+  plan: string
+  planTokens: number
+  planPrice: number
+  currency: string
+}
+
 function hasData(l: Limit): boolean {
   return !!l && (l.usage > 0 || l.remaining > 0)
 }
@@ -71,22 +80,85 @@ function colorFor(pct: number): string {
 
 function countdown(ms: number): string {
   if (!ms || ms <= 0) return ""
-  const min = Math.round(ms / 60_000)
-  if (min < 60) return `${min}м`
+  const min = Math.max(1, Math.round(ms / 60_000))
+  if (min < 60) return `${min}мин`
   const h = Math.floor(min / 60)
-  if (h < 24) return `${h}ч${min % 60 ? ` ${min % 60}м` : ""}`
-  return `${Math.floor(h / 24)}д ${h % 24}ч`
+  if (h < 24) return `${h}ч${min % 60 ? ` ${min % 60}мин` : ""}`
+  return `${Math.floor(h / 24)}дн`
 }
 
-function providerKind(context: any): "zai" | "go" | "" {
+function resetPhrase(resetAt: number): string {
+  const left = countdown(resetAt - Date.now())
+  return `сброс: ${left ? `через ${left}` : "—"}`
+}
+
+function segment(label: string, used: number, total: number, resetAt: number, status?: string): string {
+  const state = status && status !== "ok" ? `, ${status}` : ""
+  return `${used}/${total} (${label}${state}, ${resetPhrase(resetAt)})`
+}
+
+function zaiSegments(q: QuotaStatus): string {
+  const parts: string[] = []
+  if (hasData(q.fiveHour)) {
+    parts.push(segment("5 час", q.fiveHour.currentValue, q.fiveHour.usage, q.fiveHour.nextResetTime))
+  }
+  if (hasData(q.weekly)) {
+    parts.push(segment("нед", q.weekly.currentValue, q.weekly.usage, q.weekly.nextResetTime))
+  }
+  return parts.join("; ")
+}
+
+function goSegments(g: GoStatus): string {
+  const parts: string[] = []
+  const add = (label: string, w: GoWindow) => {
+    if (hasGoWindow(w)) parts.push(segment(label, w.percent, 100, w.resetsAt, w.status))
+  }
+  add("5 час", g.rolling)
+  add("нед", g.weekly)
+  add("мес", g.monthly)
+  return parts.join("; ")
+}
+
+function hasBothub(b?: BothubStatus): boolean {
+  return !!b && (b.plan !== "" || b.availableBalance > 0 || b.balance > 0 || b.planTokens > 0)
+}
+
+function formatCaps(n: number): string {
+  return Math.round(n || 0).toLocaleString("ru-RU")
+}
+
+function bothubAvailable(b: BothubStatus): number {
+  return b.availableBalance > 0 ? b.availableBalance : b.balance
+}
+
+function bothubUsedPct(b?: BothubStatus): number {
+  if (!b) return 0
+  const available = bothubAvailable(b)
+  const total = Math.max(b.planTokens, available)
+  if (!total) return 0
+  return Math.max(0, Math.min(100, Math.round(((total - available) / total) * 100)))
+}
+
+function bothubSegments(b: BothubStatus): string {
+  const plan = b.plan ? ` ${b.plan}` : ""
+  const available = bothubAvailable(b)
+  if (b.planTokens > 0) {
+    const total = Math.max(b.planTokens, available)
+    return `${formatCaps(available)}/${formatCaps(total)} Caps (остаток, пакет${plan})`
+  }
+  return `${formatCaps(available)} Caps (баланс${plan})`
+}
+
+function providerKind(context: any): "zai" | "go" | "bothub" | "" {
   try {
     const model = context.ui.model.current()
     const providerID = String(model?.providerID ?? "")
     const modelID = String(model?.modelID ?? model?.id ?? "")
-    // Проверяем Go первым: у opencode-go тоже бывают модели glm-*.
+    // Проверяем Go и Bothub раньше Z.AI: у них тоже бывают модели glm-*.
     if (providerID.startsWith("opencode-go") || providerID === "opencode" || modelID.startsWith("opencode-go/")) {
       return "go"
     }
+    if (providerID.toLowerCase().includes("bothub") || modelID.toLowerCase().includes("bothub")) return "bothub"
     if (providerID.startsWith("zai") || modelID.toLowerCase().startsWith("glm")) return "zai"
   } catch {
     // модель ещё не выбрана или API недоступен
@@ -116,21 +188,34 @@ function goLabel(g: GoStatus): { text: string; fg: string } {
   }
 }
 
+function bothubLabel(b: BothubStatus): { text: string; fg: string } {
+  const pct = bothubUsedPct(b)
+  const plan = b.plan ? ` ${b.plan}` : ""
+  const gauge = b.planTokens > 0 ? ` · ост. ${100 - pct}%` : ""
+  return {
+    text: `⚡b ${formatCaps(bothubAvailable(b))} Caps${plan}${gauge}`,
+    fg: colorFor(pct),
+  }
+}
+
 export default Plugin.define({
   id: "zai-quota.tui",
   setup(context) {
     const [zai, setZai] = createSignal<QuotaStatus | undefined>(undefined)
     const [go, setGo] = createSignal<GoStatus | undefined>(undefined)
+    const [bothub, setBothub] = createSignal<BothubStatus | undefined>(undefined)
     let timer: ReturnType<typeof setInterval> | undefined
 
     async function refresh() {
       // Провайдеры независимы: ошибка одного не должна скрывать данные другого.
-      const [z, g] = await Promise.allSettled([
+      const [z, g, b] = await Promise.allSettled([
         context.client.rpc(Quota).status({}),
         context.client.rpc(GoQuota).status({}),
+        context.client.rpc(BothubQuota).status({}),
       ])
       if (z.status === "fulfilled" && z.value) setZai(z.value)
       if (g.status === "fulfilled" && g.value) setGo(g.value)
+      if (b.status === "fulfilled" && b.value) setBothub(b.value)
     }
 
     void refresh().then(() => {
@@ -142,8 +227,10 @@ export default Plugin.define({
         const kind = providerKind(context)
         const z = zai()
         const g = go()
+        const b = bothub()
         const zaiReady = !!z && (hasData(z.fiveHour) || hasData(z.weekly))
         const goReady = hasGo(g)
+        const bothubReady = hasBothub(b)
 
         if (kind === "go") {
           return goReady ? goLabel(g!) : { text: "⚡go нет данных", fg: "#565f89" }
@@ -151,8 +238,12 @@ export default Plugin.define({
         if (kind === "zai") {
           return zaiReady ? zaiLabel(z!) : { text: "⚡z нет данных", fg: "#565f89" }
         }
+        if (kind === "bothub") {
+          return bothubReady ? bothubLabel(b!) : { text: "⚡b нет данных", fg: "#565f89" }
+        }
         if (zaiReady) return zaiLabel(z!)
         if (goReady) return goLabel(g!)
+        if (bothubReady) return bothubLabel(b!)
         return { text: "⚡ нет данных", fg: "#565f89" }
       })
 
@@ -170,7 +261,7 @@ export default Plugin.define({
       commands: [
         {
           id: "zai.quota",
-          title: "Квоты: Z.AI и OpenCode Go",
+          title: "Квоты: Z.AI, Go, Bothub",
           group: "Квоты",
           palette: true,
           slash: { name: "quota" },
@@ -178,29 +269,21 @@ export default Plugin.define({
             await refresh()
             const z = zai()
             const g = go()
+            const b = bothub()
             const zaiReady = !!z && (hasData(z.fiveHour) || hasData(z.weekly))
             const goReady = !!g && [g.rolling, g.weekly, g.monthly].some(hasGoWindow)
-            if (!zaiReady && !goReady) {
+            const bothubReady = hasBothub(b)
+            if (!zaiReady && !goReady && !bothubReady) {
               context.ui.toast.show({ message: "Не удалось получить квоты подписок", variant: "error" })
               return
             }
-            const fmtZai = (l?: Limit) =>
-              hasData(l)
-                ? `${l.currentValue}/${l.usage} кр, ост ${l.remaining}, сброс через ${countdown(l.nextResetTime - Date.now()) || "—"}`
-                : "нет данных"
-            const fmtGo = (w: GoWindow) =>
-              hasGoWindow(w)
-                ? `${w.percent}%${w.status !== "ok" ? ` (${w.status})` : ""}, сброс через ${countdown(w.resetsAt - Date.now()) || "—"}`
-                : "нет данных"
-            const zaiText = zaiReady
-              ? `Z.AI Coding Plan${z!.level ? ` (${z!.level})` : ""}: 5ч ${fmtZai(z!.fiveHour)} · нед ${fmtZai(z!.weekly)}`
-              : "Z.AI: нет данных"
-            const goText = goReady
-              ? `OpenCode Go: 5ч ${fmtGo(g!.rolling)} · нед ${fmtGo(g!.weekly)} · мес ${fmtGo(g!.monthly)}`
-              : "OpenCode Go: нет данных"
+            const lines: string[] = []
+            if (goReady) lines.push(`OpenCodeGo: ${goSegments(g!)}`)
+            if (zaiReady) lines.push(`Zai: ${zaiSegments(z!)}`)
+            if (bothubReady) lines.push(`Bothub: ${bothubSegments(b!)}`)
             context.ui.toast.show({
-              title: "Квоты подписок",
-              message: `${zaiText}\n${goText}`,
+              title: "Квоты",
+              message: lines.join("\n"),
               duration: 10_000,
             })
           },

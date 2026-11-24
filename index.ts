@@ -1,5 +1,13 @@
 import { Plugin } from "@opencode/plugin"
-import { EMPTY_GO_STATUS, EMPTY_GO_WINDOW, EMPTY_LIMIT, GoQuota, Quota } from "./rpc"
+import {
+  BothubQuota,
+  EMPTY_BOTHUB_STATUS,
+  EMPTY_GO_STATUS,
+  EMPTY_GO_WINDOW,
+  EMPTY_LIMIT,
+  GoQuota,
+  Quota,
+} from "./rpc"
 
 /**
  * Серверная часть плагина квот: получает остатки подписок
@@ -23,6 +31,7 @@ import { EMPTY_GO_STATUS, EMPTY_GO_WINDOW, EMPTY_LIMIT, GoQuota, Quota } from ".
 
 const ZAI_ENDPOINT = "https://api.z.ai/api/monitor/usage/quota/limit"
 const GO_ENDPOINT = "https://opencode.ai/zen/go/v1/usage"
+const BOTHUB_ENDPOINT = "https://bothub.chat/api/v2/auth/me"
 const CACHE_MS = 30_000
 
 type Limit = {
@@ -41,6 +50,7 @@ type QuotaStatus = { level: string; fiveHour: LimitStatus; weekly: LimitStatus }
 
 type GoWindow = typeof EMPTY_GO_WINDOW
 type GoStatus = typeof EMPTY_GO_STATUS
+type BothubStatus = typeof EMPTY_BOTHUB_STATUS
 
 type CredentialValue = { type?: string; key?: string; access?: string }
 
@@ -65,6 +75,8 @@ const emptyGo = (): GoStatus => ({
   weekly: { ...EMPTY_GO_WINDOW },
   monthly: { ...EMPTY_GO_WINDOW },
 })
+
+const emptyBothub = (): BothubStatus => ({ ...EMPTY_BOTHUB_STATUS })
 
 async function readTextKey(path: string): Promise<string | undefined> {
   const { readFile } = await import("node:fs/promises")
@@ -120,7 +132,7 @@ async function readIntegrationKey(ctx: GoKeyContext, integrationIDs: string[]): 
   return undefined
 }
 
-async function readGoAuthFileKey(): Promise<string | undefined> {
+async function readAuthFileKey(match: (providerID: string) => boolean): Promise<string | undefined> {
   const { homedir } = await import("node:os")
   const { readFile } = await import("node:fs/promises")
   const candidates = [
@@ -130,9 +142,8 @@ async function readGoAuthFileKey(): Promise<string | undefined> {
   for (const path of candidates) {
     try {
       const json: any = JSON.parse(await readFile(path, "utf8"))
-      for (const providerID of ["opencode-go", "opencode"]) {
-        const entry = json?.[providerID]
-        if (!entry) continue
+      for (const [providerID, entry] of Object.entries<any>(json ?? {})) {
+        if (!match(providerID) || !entry) continue
         if ((entry.type === "api" || entry.type === "zen") && entry.key) return String(entry.key)
         if (entry.type === "oauth" && entry.access) return String(entry.access)
       }
@@ -141,6 +152,14 @@ async function readGoAuthFileKey(): Promise<string | undefined> {
     }
   }
   return undefined
+}
+
+async function readGoAuthFileKey(): Promise<string | undefined> {
+  return readAuthFileKey((providerID) => providerID === "opencode-go" || providerID === "opencode")
+}
+
+async function readBothubAuthFileKey(): Promise<string | undefined> {
+  return readAuthFileKey((providerID) => providerID.toLowerCase().includes("bothub"))
 }
 
 async function readGoKey(ctx: GoKeyContext): Promise<string | undefined> {
@@ -157,14 +176,35 @@ async function readGoKey(ctx: GoKeyContext): Promise<string | undefined> {
   return readGoAuthFileKey()
 }
 
+async function readBothubKey(ctx: GoKeyContext): Promise<string | undefined> {
+  const env = process.env.BOTHUB_API_KEY
+  if (env) return env
+  for (const name of ["bothub-quota.key", "bothub.key"]) {
+    for (const path of await configDirKeyPaths(name)) {
+      const key = await readTextKey(path)
+      if (key) return key
+    }
+  }
+  const fromIntegration = await readIntegrationKey(ctx, ["bothub", "bothub-chat"])
+  if (fromIntegration) return fromIntegration
+  return readBothubAuthFileKey()
+}
+
+const toNumber = (value: unknown): number => {
+  const n = typeof value === "string" ? Number(value) : value
+  return typeof n === "number" && Number.isFinite(n) ? n : 0
+}
+
+// api.z.ai иногда не присылает nextResetTime (например, у 5-часового пула),
+// а RPC-схема требует там число — отсутствующие поля приводим к нулю.
 const toStatus = (l: Limit | undefined): LimitStatus =>
   l
     ? {
-        usage: l.usage,
-        currentValue: l.currentValue,
-        remaining: l.remaining,
-        percentage: l.percentage,
-        nextResetTime: l.nextResetTime,
+        usage: toNumber(l.usage),
+        currentValue: toNumber(l.currentValue),
+        remaining: toNumber(l.remaining),
+        percentage: toNumber(l.percentage),
+        nextResetTime: toNumber(l.nextResetTime),
       }
     : { ...EMPTY_LIMIT }
 
@@ -238,6 +278,37 @@ async function fetchGo(key: string): Promise<GoStatus> {
   }
 }
 
+async function fetchBothub(key: string): Promise<BothubStatus> {
+  try {
+    const res = await fetch(BOTHUB_ENDPOINT, {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        Accept: "application/json",
+        "User-Agent": "opencode-quota-plugin/1.0",
+      },
+    })
+    if (!res.ok) {
+      console.warn("bothub-quota: HTTP", res.status)
+      return emptyBothub()
+    }
+    const json: any = await res.json()
+    const sub = json?.subscription ?? {}
+    const plan = sub?.plan ?? json?.plan ?? {}
+    const balance = toNumber(sub?.balance ?? json?.balance)
+    return {
+      balance,
+      availableBalance: toNumber(sub?.availableBalance ?? json?.availableBalance ?? balance),
+      plan: typeof plan?.type === "string" ? plan.type : "",
+      planTokens: toNumber(plan?.tokens),
+      planPrice: toNumber(plan?.price),
+      currency: typeof plan?.currency === "string" ? plan.currency : "RUB",
+    }
+  } catch (error) {
+    console.warn("bothub-quota: запрос не удался", error)
+    return emptyBothub()
+  }
+}
+
 export default Plugin.define({
   id: "zai-quota",
   async setup(ctx) {
@@ -245,6 +316,8 @@ export default Plugin.define({
     let zaiInflight: Promise<QuotaStatus> | undefined
     let goCache: { at: number; data: GoStatus } | undefined
     let goInflight: Promise<GoStatus> | undefined
+    let bothubCache: { at: number; data: BothubStatus } | undefined
+    let bothubInflight: Promise<BothubStatus> | undefined
 
     await ctx.rpc.register(Quota, {
       status: async () => {
@@ -275,6 +348,22 @@ export default Plugin.define({
         })
         return goInflight.finally(() => {
           goInflight = undefined
+        })
+      },
+    })
+
+    await ctx.rpc.register(BothubQuota, {
+      status: async () => {
+        const key = await readBothubKey(ctx)
+        if (!key) return emptyBothub()
+        const now = Date.now()
+        if (bothubCache && now - bothubCache.at < CACHE_MS) return bothubCache.data
+        bothubInflight ??= fetchBothub(key).then((data) => {
+          bothubCache = { at: Date.now(), data }
+          return data
+        })
+        return bothubInflight.finally(() => {
+          bothubInflight = undefined
         })
       },
     })
